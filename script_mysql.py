@@ -8,6 +8,8 @@ import shutil
 import re
 import json
 import hashlib
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple, Optional, List, Union
@@ -262,6 +264,44 @@ async def send_text_safe(client: TelegramClient, chat_id: int, text: str, *, par
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
 
+# ---------- NEW: robust album sender with local downloads ----------
+async def _download_one(url: str, dest_dir: str) -> Optional[str]:
+    """Download a single image to dest_dir. Returns path or None on failure."""
+    # crude ext guess to hint Telegram it's a photo
+    guess = url.split("?")[0].lower()
+    ext = ".jpg"
+    for e in (".jpg", ".jpeg", ".png", ".webp"):
+        if guess.endswith(e):
+            ext = e
+            break
+    filename = hashlib.sha1(url.encode("utf-8")).hexdigest() + ext
+    path = os.path.join(dest_dir, filename)
+
+    try:
+        # try aiohttp first
+        import aiohttp  # type: ignore
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                with open(path, "wb") as f:
+                    f.write(data)
+        return path
+    except Exception as e:
+        # fallback to urllib
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = r.read()
+                with open(path, "wb") as f:
+                    f.write(data)
+            return path
+        except Exception as e2:
+            log.warning("Download failed for %s: %s / %s", url, e, e2)
+            return None
+
 async def send_files_safe(
     client: TelegramClient,
     chat_id: int,
@@ -271,35 +311,102 @@ async def send_files_safe(
     parse_mode: str = 'html'
 ):
     """
-    If multiple files: send as an album (single grouped post).
-    If single file: send as one photo with caption.
-    Returns a list of message ids (album -> list of message ids from the group).
+    Force a single grouped post (album) whenever there are multiple images:
+    1) Download up to 10 images to local temp files (Telegram groups local photos reliably).
+    2) Send all at once so Telegram creates an album with caption on the first media.
+    3) If that fails, retry with remote URLs list.
+    4) Final fallback: text + links (last resort).
     """
     if not files:
         return []
 
+    # Telegram album limit = 10
+    files = files[:10]
+
+    # 1) Try local downloads
+    tmpdir = tempfile.mkdtemp(prefix="tg_album_")
+    local_paths: List[str] = []
     try:
-        await throttle()
-        result = await client.send_file(chat_id, files, caption=caption, parse_mode=parse_mode)
-        if isinstance(result, list):
-            return [m.id for m in result]
-        return [result.id]
-    except FloodWaitError as e:
-        await asyncio.sleep(e.seconds + 1)
-        await throttle()
-        result = await client.send_file(chat_id, files, caption=caption, parse_mode=parse_mode)
-        if isinstance(result, list):
-            return [m.id for m in result]
-        return [result.id]
-    except Exception as e:
-        # Fallback: at least send text + links
-        log.warning("Album send failed for chat %s: %s. Falling back to text+links.", chat_id, e)
-        ids = []
-        if caption:
-            ids.extend(await send_text_safe(client, chat_id, caption, parse_mode=parse_mode, link_preview=True))
-        for f in files:
-            ids.extend(await send_text_safe(client, chat_id, f, parse_mode=parse_mode, link_preview=True))
-        return ids
+        for u in files:
+            p = await _download_one(u, tmpdir)
+            if p:
+                local_paths.append(p)
+
+        if len(local_paths) == len(files) and len(local_paths) > 1:
+            try:
+                await throttle()
+                result = await client.send_file(
+                    chat_id,
+                    local_paths,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    force_document=False  # prefer photos
+                )
+                if isinstance(result, list):
+                    return [m.id for m in result]
+                return [result.id]
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+                await throttle()
+                result = await client.send_file(
+                    chat_id,
+                    local_paths,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    force_document=False
+                )
+                if isinstance(result, list):
+                    return [m.id for m in result]
+                return [result.id]
+            except Exception as e:
+                log.warning("Local album send failed for chat %s: %s. Will retry with URLs.", chat_id, e)
+
+        # 2) Retry with URLs list (Telethon should still group if all are valid photos)
+        try:
+            await throttle()
+            result = await client.send_file(
+                chat_id,
+                files,
+                caption=caption,
+                parse_mode=parse_mode,
+                force_document=False
+            )
+            if isinstance(result, list):
+                return [m.id for m in result]
+            return [result.id]
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 1)
+            await throttle()
+            result = await client.send_file(
+                chat_id,
+                files,
+                caption=caption,
+                parse_mode=parse_mode,
+                force_document=False
+            )
+            if isinstance(result, list):
+                return [m.id for m in result]
+            return [result.id]
+        except Exception as e:
+            # 3) Final fallback: at least deliver something
+            log.warning("URL album send failed for chat %s: %s. Falling back to text+links.", chat_id, e)
+            ids = []
+            if caption:
+                ids.extend(await send_text_safe(client, chat_id, caption, parse_mode=parse_mode, link_preview=True))
+            for f in files:
+                ids.extend(await send_text_safe(client, chat_id, f, parse_mode=parse_mode, link_preview=True))
+            return ids
+    finally:
+        # cleanup temp files
+        try:
+            for p in local_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
 
 async def send_product_photo(client: TelegramClient, chat_id: int, name: str, description: str, url: str):
     """Legacy helper for single-image replies."""
@@ -369,13 +476,15 @@ async def post_scheduled_message(client: TelegramClient, chat_id: int, msg_doc: 
     - If no images: send text-only message
     """
     text = msg_doc.get("text", "") or ""
-    images = msg_doc.get("images", []) or []
+    images = (msg_doc.get("images", []) or [])[:10]  # enforce album limit
     parse_mode = 'html' if msg_doc.get("parseMode", "HTML").upper() == "HTML" else None
     disable_preview = bool(msg_doc.get("disablePreview", True))
 
     if images:
+        # ONE grouped post: album with caption on first media
         return await send_files_safe(client, chat_id, images, caption=text if text else None, parse_mode=parse_mode or 'html')
     else:
+        # text-only
         return await send_text_safe(client, chat_id, text, parse_mode=parse_mode or 'html', link_preview=not disable_preview)
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -423,8 +532,6 @@ async def main():
         chats_coll.create_index("chatId", unique=True)
         scheduled_coll.create_index([("status", 1), ("scheduledAt", 1)])
         deliveries_coll.create_index([("schedId", 1), ("chatId", 1)], unique=True)
-        # Optional: dedupe similar campaigns by content/time
-        # scheduled_coll.create_index([("contentHash", 1), ("scheduledAt", 1)])
     except Exception as e:
         log.warning("Index creation warning: %s", e)
 
@@ -803,7 +910,7 @@ async def main():
                                 log.warning("Claim (schedId=%s, chatId=%s) failed: %s", msg_id, cid, e)
                                 continue
 
-                            # Perform the send
+                            # Perform the send (album enforced inside)
                             try:
                                 ids = await post_scheduled_message(client, cid, msg)
                                 delivered.append({"chatId": cid, "messageIds": ids})
@@ -817,8 +924,6 @@ async def main():
                                     {"schedId": msg_id, "chatId": cid},
                                     {"$set": {"sentAt": None, "error": str(e)}}
                                 )
-                                # Optionally deactivate chat on permanent errors
-                                # chats_coll.update_one({"chatId": cid}, {"$set": {"isActive": False, "lastError": str(e)}})
 
                         scheduled_coll.update_one(
                             {"_id": msg_id},
