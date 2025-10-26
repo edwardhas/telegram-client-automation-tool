@@ -6,12 +6,15 @@ import shlex
 import sqlite3
 import shutil
 import re
+import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple, Optional, List, Union
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.tl.types import ChatBannedRights  # optional type hint only
 from pymongo import MongoClient
 from bson import ObjectId
 
@@ -26,7 +29,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("bot")
-logging.getLogger("telethon").setLevel(logging.INFO)  # set to DEBUG for deeper logs
+logging.getLogger("telethon").setLevel(logging.INFO)  # set to DEBUG for deep logs
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Config
@@ -118,57 +121,85 @@ def caption_for(name: str, description: str) -> str:
         cap = f"{base}\n{truncated}" if truncated else base
     return cap
 
-# NEW: robust parse /insert "Name" "Description" [images...] <time-or-Now>
-def parse_insert_args_v2(text: str) -> Optional[Tuple[str, str, List[str], str]]:
+# NEW: robust parse /insert "Name" "Description" [images...] <time-or-Now> [groups=[-1001,-1002]]
+def parse_insert_args_v2(text: str) -> Optional[Tuple[str, str, List[str], str, List[int]]]:
     """
-    /insert "Name" "Description" [https://a.jpg https://b.jpg] Oct 25 9am
-    /insert "Name" "Description" [https://a.jpg,https://b.jpg] Now
-    - Name, Description: quoted if they contain spaces
-    - Images: tokens wrapped between '[' and ']' (spaces or commas inside)
-    - Scheduled time: everything after the closing ']' as one free-form string (e.g., 'Oct 25 9am', 'Now')
+    Accepts:
+      /insert "Name" "Description" [https://a.jpg https://b.jpg] Oct 25 9am
+      /insert "Name" "Description" [https://a.jpg,https://b.jpg] Now
+      /insert "Name" "Description" [img] Oct 30 4pm groups=[-1001,-1002]
+    - Skips duplicate '/insert' tokens at the start
+    - Images: collect tokens between '[' and ']' (spaces or commas inside)
+    - Scheduled time: everything after the closing ']' up to optional 'groups=[...]'
+    - Optional target groups as groups=[id1,id2,...]
     """
     parts = shlex.split(text)
-    if len(parts) < 5 or parts[0].lower() != "/insert":
+    if not parts:
         return None
 
-    name = parts[1]
-    description = parts[2]
+    # Skip any leading '/insert' tokens
+    i = 0
+    while i < len(parts) and parts[i].lower() == "/insert":
+        i += 1
 
-    i = 3
-    if i >= len(parts):
+    # Need at least: name, description, [images], schedule/Now
+    if i + 4 > len(parts):
         return None
 
-    # Must start with a token that begins with '['
-    if not parts[i].startswith('['):
+    name = parts[i]; i += 1
+    description = parts[i]; i += 1
+
+    # images must start with '['
+    if i >= len(parts) or not parts[i].startswith('['):
         return None
 
-    # Collect tokens until a token ending with ']'
     images_tokens = []
     while i < len(parts):
         tok = parts[i]
         images_tokens.append(tok)
         if tok.endswith(']'):
+            i += 1
             break
         i += 1
     else:
-        # no closing bracket
+        # never found closing bracket
         return None
 
-    # Join the bracketed segment and strip the brackets
     bracketed = " ".join(images_tokens).strip()
     if not (bracketed.startswith('[') and bracketed.endswith(']')):
         return None
     inner = bracketed[1:-1].strip()
-
-    # Split inner by commas or whitespace
     images = [u.strip() for u in re.split(r"[,\s]+", inner) if u.strip()]
 
-    # Everything after the closing ']' is the scheduled time string
-    scheduled_str = " ".join(parts[i+1:]).strip()
+    # Everything after images could be "<time>" [groups=[...]]
+    trailing = " ".join(parts[i:]).strip()
+    if not trailing:
+        return None
+
+    # Optional groups=[...]
+    target_ids: List[int] = []
+    m = re.search(r"\bgroups=\[(.*?)\]\s*$", trailing, flags=re.I)
+    if m:
+        groups_blob = m.group(1)
+        trailing = trailing[:m.start()].strip()  # remove groups=[...] from time part
+        # split by commas
+        for g in groups_blob.split(","):
+            g = g.strip()
+            if not g:
+                continue
+            try:
+                target_ids.append(int(g))
+            except ValueError:
+                pass
+
+    scheduled_str = trailing.strip()
     if not scheduled_str:
         return None
 
-    return name, description, images, scheduled_str
+    # unique target ids (if any)
+    target_ids = sorted(set(target_ids))
+
+    return name, description, images, scheduled_str, target_ids
 
 def parse_update_args(text: str) -> Optional[Tuple[str, str, str, str]]:
     """
@@ -198,8 +229,17 @@ def parse_update_args(text: str) -> Optional[Tuple[str, str, str, str]]:
         name, desc = mid_parts[0], mid_parts[1]
     return oid, name, desc, url
 
+# Campaign hash (optional dedupe across time/content)
+def campaign_hash(text: str, images: List[str]) -> str:
+    payload = {
+        "text": (text or "").strip(),
+        "images": sorted(images or [])
+    }
+    h = hashlib.sha256(json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8')).hexdigest()
+    return f"sha256:{h}"
+
 # ───────────────────────────────────────────────────────────────────────────────
-# Automation helpers (Option A)
+# Automation helpers
 # ───────────────────────────────────────────────────────────────────────────────
 GLOBAL_GAP = 0.25  # seconds between API calls (gentle global throttle)
 _last_sent_global = 0.0
@@ -222,33 +262,44 @@ async def send_text_safe(client: TelegramClient, chat_id: int, text: str, *, par
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
 
-async def send_files_safe(client: TelegramClient, chat_id: int, files: List[str], *, caption: Optional[str] = None, parse_mode: str = 'html'):
+async def send_files_safe(
+    client: TelegramClient,
+    chat_id: int,
+    files: List[str],
+    *,
+    caption: Optional[str] = None,
+    parse_mode: str = 'html'
+):
     """
-    Send one or multiple image URLs.
-    - If one file: caption applied.
-    - If multiple: send each individually (caption on first only) to keep it simple.
+    If multiple files: send as an album (single grouped post).
+    If single file: send as one photo with caption.
+    Returns a list of message ids (album -> list of message ids from the group).
     """
-    ids = []
     if not files:
-        return ids
+        return []
 
-    for idx, f in enumerate(files):
-        try:
-            await throttle()
-            cap = caption if (idx == 0 and caption) else None
-            msg = await client.send_file(chat_id, f, caption=cap, parse_mode=parse_mode)
-            ids.append(msg.id)
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 1)
-            await throttle()
-            cap = caption if (idx == 0 and caption) else None
-            msg = await client.send_file(chat_id, f, caption=cap, parse_mode=parse_mode)
-            ids.append(msg.id)
-        except Exception as e:
-            log.warning("send_file failed for chat %s, url=%s: %s. Falling back to text link.", chat_id, f, e)
-            fallback = f if idx > 0 else ((caption + "\n" if caption else "") + f)
-            ids.extend(await send_text_safe(client, chat_id, fallback, parse_mode='html', link_preview=True))
-    return ids
+    try:
+        await throttle()
+        result = await client.send_file(chat_id, files, caption=caption, parse_mode=parse_mode)
+        if isinstance(result, list):
+            return [m.id for m in result]
+        return [result.id]
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        await throttle()
+        result = await client.send_file(chat_id, files, caption=caption, parse_mode=parse_mode)
+        if isinstance(result, list):
+            return [m.id for m in result]
+        return [result.id]
+    except Exception as e:
+        # Fallback: at least send text + links
+        log.warning("Album send failed for chat %s: %s. Falling back to text+links.", chat_id, e)
+        ids = []
+        if caption:
+            ids.extend(await send_text_safe(client, chat_id, caption, parse_mode=parse_mode, link_preview=True))
+        for f in files:
+            ids.extend(await send_text_safe(client, chat_id, f, parse_mode=parse_mode, link_preview=True))
+        return ids
 
 async def send_product_photo(client: TelegramClient, chat_id: int, name: str, description: str, url: str):
     """Legacy helper for single-image replies."""
@@ -282,25 +333,22 @@ def parse_scheduled_to_utc(s: str) -> datetime:
     """
     Parse free-form time like:
       - 'October 25', 'Oct 25 9am PT', '2025-10-25T09:00'
-      - 'Now'  (case-insensitive) → immediate send
+      - 'Now'  (case-insensitive) → send in 5 minutes
     Returns timezone-aware UTC datetime.
     Rules:
-      - 'Now' → current UTC + 1 second
+      - 'Now' → current UTC + 5 minutes  (changed per request)
       - date-only → default 09:00 local
       - no year → use this year; if already past, bump to next year
       - no tz → assume SERVICE_TZ
     """
     s = s.strip()
     if s.lower() == "now":
-        return datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=1)
+        return datetime.now(timezone.utc) + timedelta(minutes=5)
 
     now_local = datetime.now(tz=SERVICE_TZ)
-
-    # dateutil parse with default baseline in local tz (so missing fields are sane)
     default_base = now_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     dt = dtparser.parse(s, dayfirst=False, fuzzy=True, default=default_base)
 
-    # If no explicit time in the input, set default hour
     user_provided_time = bool(re.search(r"\b(\d{1,2}(:\d{2})?\s*(am|pm))\b", s, re.I) or re.search(r"\b\d{1,2}:\d{2}\b", s))
     candidate = dt
     if candidate.tzinfo is None:
@@ -308,7 +356,6 @@ def parse_scheduled_to_utc(s: str) -> datetime:
     if not user_provided_time:
         candidate = candidate.replace(hour=DEFAULT_SEND_HOUR, minute=0, second=0, microsecond=0)
 
-    # If no year present in input, roll to next year if already past
     year_in_input = re.search(r"\b(19|20)\d{2}\b", s) is not None
     if not year_in_input and candidate.astimezone(SERVICE_TZ) < now_local:
         candidate = candidate.replace(year=candidate.year + 1)
@@ -317,25 +364,19 @@ def parse_scheduled_to_utc(s: str) -> datetime:
 
 async def post_scheduled_message(client: TelegramClient, chat_id: int, msg_doc: dict):
     """
-    Sends one scheduled message to a chat: text + optional images.
-    msg_doc fields:
-      - text (HTML ok)
-      - images: list of URLs (optional)
-      - parseMode: 'HTML'|'MarkdownV2'|'None' (default HTML)
-      - disablePreview: bool
+    Send one scheduled message as a single post:
+    - If images present: send as album with caption = text
+    - If no images: send text-only message
     """
-    text = msg_doc.get("text", "")
+    text = msg_doc.get("text", "") or ""
     images = msg_doc.get("images", []) or []
     parse_mode = 'html' if msg_doc.get("parseMode", "HTML").upper() == "HTML" else None
     disable_preview = bool(msg_doc.get("disablePreview", True))
 
-    message_ids = []
-    if text:
-        message_ids.extend(await send_text_safe(client, chat_id, text, parse_mode='html' if parse_mode else None, link_preview=not disable_preview))
     if images:
-        caption = None
-        message_ids.extend(await send_files_safe(client, chat_id, images, caption=caption, parse_mode='html' if parse_mode else None))
-    return message_ids
+        return await send_files_safe(client, chat_id, images, caption=text if text else None, parse_mode=parse_mode or 'html')
+    else:
+        return await send_text_safe(client, chat_id, text, parse_mode=parse_mode or 'html', link_preview=not disable_preview)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Main
@@ -366,10 +407,28 @@ async def main():
 
     db = mongo[MONGO_DB]
     products = db[MONGO_COLL]                   # your product CRUD collection
-    chats_coll = db["chats"]                    # auto-discovered chats
-    scheduled_coll = db["scheduled_messages"]   # "Date table"
+    chats_coll = db["chats"]                    # chat registry
+    scheduled_coll = db["scheduled_messages"]   # campaigns / date table
+    deliveries_coll = db["deliveries"]          # per-chat idempotency
 
-    # ── AUTO-DISCOVERY OF CHATS (no /bind needed) ──────────────────────────────
+    # Guard: don't accidentally use a sessions-like collection for products
+    if MONGO_COLL.strip().lower() in {"session", "sessions"}:
+        raise RuntimeError(
+            f"MONGO_COLL='{MONGO_COLL}' looks like a sessions collection. "
+            "Change 'collection_name' in config.ini to something like 'products'."
+        )
+
+    # ── Create helpful indexes (idempotent) ────────────────────────────────────
+    try:
+        chats_coll.create_index("chatId", unique=True)
+        scheduled_coll.create_index([("status", 1), ("scheduledAt", 1)])
+        deliveries_coll.create_index([("schedId", 1), ("chatId", 1)], unique=True)
+        # Optional: dedupe similar campaigns by content/time
+        # scheduled_coll.create_index([("contentHash", 1), ("scheduledAt", 1)])
+    except Exception as e:
+        log.warning("Index creation warning: %s", e)
+
+    # ── EVENT-DRIVEN CHAT DISCOVERY (no iter_dialogs for bots) ─────────────────
     async def upsert_chat(event_chat, *, active: bool = True):
         try:
             chat_id = getattr(event_chat, "id", None)
@@ -377,16 +436,19 @@ async def main():
                 return
             doc = {
                 "chatId": chat_id,
-                "title": getattr(event_chat, "title", None),
-                "type": event_chat.__class__.__name__.lower(),
+                "title": getattr(event_chat, "title", getattr(event_chat, "username", None)),
+                "type": event_chat.__class__.__name__.lower(),  # 'channel','chat','user',...
                 "isActive": active,
-                "lastSeenAt": datetime.utcnow().replace(tzinfo=timezone.utc)
+                "lastSeenAt": datetime.now(timezone.utc)
             }
-            chats_coll.update_one({"chatId": chat_id}, {"$set": doc, "$setOnInsert": {"firstSeenAt": doc["lastSeenAt"]}}, upsert=True)
+            chats_coll.update_one(
+                {"chatId": chat_id},
+                {"$set": doc, "$setOnInsert": {"firstSeenAt": doc["lastSeenAt"]}},
+                upsert=True
+            )
         except Exception as e:
             log.warning("upsert_chat failed: %s", e)
 
-    # Catch-all logger + auto-discover on any message
     @client.on(events.NewMessage)
     async def _log_and_discover(event):
         try:
@@ -398,7 +460,6 @@ async def main():
         except Exception as e:
             log.warning("Failed to log/discover update: %s", e)
 
-    # Track when the bot is added/removed from groups/channels
     @client.on(events.ChatAction)
     async def on_chat_action(event):
         try:
@@ -410,6 +471,15 @@ async def main():
                 log.info("Bot removed from chat %s", getattr(event.chat, "id", None))
         except Exception as e:
             log.warning("ChatAction handling failed: %s", e)
+
+    # QUICK REGISTER CURRENT GROUP/CHANNEL
+    @client.on(events.NewMessage(pattern=r"(?i)^/here(?:\s|$)"))
+    async def on_here(event):
+        """Run /here inside a group/channel to register it immediately."""
+        if not event.chat:
+            return await event.reply("This command must be used in a group/channel.")
+        await upsert_chat(event.chat, active=True)
+        await event.reply(f"Registered this chat: <code>{getattr(event.chat, 'id', None)}</code>", parse_mode='html')
 
     # ── ADMIN/UTILITY COMMANDS ─────────────────────────────────────────────────
     @client.on(events.NewMessage(pattern=r"(?i)^/id(?:\s|$)"))
@@ -427,20 +497,77 @@ async def main():
             "👋 Bot is alive.\n"
             "Product commands:\n"
             " • /select\n"
-            " • /insert \"Name\" \"Description\" [https://a.jpg https://b.jpg] Oct 25 9am | Now\n"
+            " • /insert \"Name\" \"Description\" [https://a.jpg https://b.jpg] Oct 25 9am | Now [groups=[-1001,-1002]]\n"
             " • /update <object_id> <name> <description> <url>\n"
             " • /delete <object_id>\n\n"
-            "Automation: the bot auto-sends docs from 'scheduled_messages' to all active chats.",
+            "Admin:\n"
+            " • /here   (run this inside a group/channel to register it)\n"
+            " • /groups_add [ -1001 -1002 ]\n"
+            " • /groups_list\n\n"
+            "Automation: campaigns in 'scheduled_messages' are sent to explicit targetChatIds or to all active chats.",
             parse_mode='html'
         )
 
-    # ── PRODUCT CRUD ───────────────────────────────────────────────────────────
+    # Add groups manually (private, admin only)
+    @client.on(events.NewMessage(pattern=r"(?i)^/groups_add(?:\s|$)"))
+    async def on_groups_add(event):
+        sender = await event.get_sender()
+        if not is_authorized(sender.id):
+            return
+        parts = shlex.split(event.raw_text)
+        if len(parts) < 2:
+            return await event.reply('Usage: <code>/groups_add [ -1001 -1002 ]</code>', parse_mode='html')
+
+        blob = " ".join(parts[1:])
+        m = re.search(r"\[(.*)\]", blob)
+        if not m:
+            return await event.reply('Usage: <code>/groups_add [ -1001 -1002 ]</code>', parse_mode='html')
+
+        ids = []
+        for token in re.split(r"[,\s]+", m.group(1).strip()):
+            if not token:
+                continue
+            try:
+                ids.append(int(token))
+            except ValueError:
+                pass
+        ids = sorted(set(ids))
+        if not ids:
+            return await event.reply("No valid IDs found.", parse_mode='html')
+
+        added = 0
+        for cid in ids:
+            try:
+                chats_coll.update_one(
+                    {"chatId": cid},
+                    {"$set": {"chatId": cid, "title": None, "type": "channel", "isActive": True, "lastSeenAt": datetime.now(timezone.utc)},
+                     "$setOnInsert": {"firstSeenAt": datetime.now(timezone.utc)}},
+                    upsert=True
+                )
+                added += 1
+            except Exception as e:
+                log.warning("Failed to upsert chatId %s: %s", cid, e)
+        await event.reply(f"✅ Registered/updated {added} chat IDs.", parse_mode='html')
+
+    @client.on(events.NewMessage(pattern=r"(?i)^/groups_list(?:\s|$)"))
+    async def on_groups_list(event):
+        sender = await event.get_sender()
+        if not is_authorized(sender.id):
+            return
+        docs = list(chats_coll.find({}, {"chatId": 1, "title": 1, "type": 1, "isActive": 1}).limit(200))
+        if not docs:
+            return await event.reply("No known chats.", parse_mode='html')
+        lines = []
+        for d in docs:
+            lines.append(f"{d.get('chatId')} | {esc(d.get('title') or '')} | {d.get('type')} | {'active' if d.get('isActive') else 'inactive'}")
+        await event.reply("<b>Known chats</b>:\n" + "\n".join(lines), parse_mode='html')
+
+    # ── PRODUCT CRUD (unchanged, lightweight) ──────────────────────────────────
     @client.on(events.NewMessage(pattern=r"(?i)^/select(?:\s|$)"))
     async def on_select(event):
         sender = await event.get_sender()
         if not is_authorized(sender.id):
             return
-        # Read images[] (fallback to legacy url)
         cursor = products.find({}, projection={"name": 1, "description": 1, "images": 1, "url": 1}).limit(50)
         found = False
         try:
@@ -460,27 +587,33 @@ async def main():
         except Exception as e:
             await event.reply(f"❌ Error listing products: <code>{esc(e)}</code>", parse_mode='html')
 
-    # NEW /insert format with images[] + scheduled time (or Now)
+    # NEW /insert format with images[] + scheduled time (or Now) + optional groups=[...]
     @client.on(events.NewMessage(pattern=r"(?i)^/insert(?:\s|$)"))
     async def on_insert(event):
         sender = await event.get_sender()
         if not is_authorized(sender.id):
             return
 
-        parsed = parse_insert_args_v2(event.raw_text)
+        raw = event.raw_text.strip()
+        if raw.lower().startswith("/insert /insert"):
+            raw = raw[8:].lstrip()
+
+        parsed = parse_insert_args_v2(raw)
         if not parsed:
             return await event.reply(
                 "Usage:\n"
                 "<code>/insert \"Name\" \"Description\" [https://a.jpg https://b.jpg] Oct 25 9am</code>\n"
                 "or\n"
                 "<code>/insert \"Name\" \"Description\" [https://a.jpg] Now</code>\n"
+                "Optional explicit targets:\n"
+                "<code>/insert \"Name\" \"Description\" [img] Oct 30 4pm groups=[-1001,-1002]</code>\n"
                 "Notes:\n"
                 " • Images must be inside [ ] separated by spaces or commas\n"
-                " • Time can be date-only (defaults 09:00 local) or full time; use 'Now' to send immediately\n",
+                " • Time can be date-only (defaults 09:00 local) or full time; use 'Now' to send in 5 minutes\n",
                 parse_mode='html'
             )
 
-        name, description, images, when_str = parsed
+        name, description, images, when_str, target_ids = parsed
 
         try:
             scheduled_utc = parse_scheduled_to_utc(when_str)
@@ -500,7 +633,7 @@ async def main():
         except Exception as e:
             return await event.reply(f"❌ Insert error: <code>{esc(e)}</code>", parse_mode='html')
 
-        # 2) create scheduled message for ALL chats
+        # 2) create scheduled message
         text = f"<b>{esc(name)}</b>\n{esc(description)}"
         sched_doc = {
             "_id": f"auto_{product_id}",
@@ -509,16 +642,34 @@ async def main():
             "parseMode": "HTML",
             "disablePreview": True,
             "scheduledAt": scheduled_utc,
-            "targets": "all",
+            "targets": "all" if not target_ids else "explicit",
+            "targetChatIds": target_ids if target_ids else None,
             "status": "scheduled",
-            "productId": product_id
+            "productId": product_id,
+            "createdAt": datetime.now(timezone.utc),
+            "contentHash": campaign_hash(text, images)
         }
+        # Remove None fields
+        sched_doc = {k: v for k, v in sched_doc.items() if v is not None}
         try:
             db["scheduled_messages"].insert_one(sched_doc)
         except Exception as e:
             log.warning("Failed to insert scheduled message: %s", e)
 
-        # 3) echo the product back now (first image + caption) and confirm schedule
+        # 2b) Resolve and SHOW targets right now in the reply
+        if target_ids:
+            resolved_chat_ids = sorted(set(target_ids))
+        else:
+            resolved_chat_ids = [
+                d["chatId"]
+                for d in chats_coll.find(
+                    {"isActive": True, "type": {"$ne": "user"}},
+                    {"chatId": 1}
+                )
+            ]
+            resolved_chat_ids = sorted(set(int(x) for x in resolved_chat_ids))
+
+        # 3) echo preview now (first image + caption) and confirm schedule + targets
         if images:
             await send_files_safe(client, event.chat_id, [images[0]], caption=caption_for(name, description))
         else:
@@ -526,7 +677,20 @@ async def main():
 
         local_time = scheduled_utc.astimezone(SERVICE_TZ).strftime("%Y-%m-%d %H:%M %Z")
         utc_time = scheduled_utc.strftime("%Y-%m-%d %H:%M UTC")
-        await event.reply(f"📅 Scheduled for: <b>{esc(local_time)}</b> (<code>{esc(utc_time)}</code>)", parse_mode='html')
+        if resolved_chat_ids:
+            # show up to 10 ids to keep it tidy
+            preview = ", ".join(str(c) for c in resolved_chat_ids[:10])
+            suffix = "" if len(resolved_chat_ids) <= 10 else f" …(+{len(resolved_chat_ids)-10} more)"
+            targets_line = f"targets: {len(resolved_chat_ids)} chats [{preview}{suffix}]"
+        else:
+            targets_line = ("targets: none yet — add with /here in a group or "
+                            "/groups_add [ -1001234567890 ]")
+
+        await event.reply(
+            f"📅 Scheduled for: <b>{esc(local_time)}</b> (<code>{esc(utc_time)}</code>)\n"
+            f"{esc(targets_line)}",
+            parse_mode='html'
+        )
 
     # Keep /update and /delete as-is (legacy single url for now)
     @client.on(events.NewMessage(pattern=r"(?i)^/update(?:\s|$)"))
@@ -580,24 +744,26 @@ async def main():
         except Exception as e:
             await event.reply(f"❌ Delete error: <code>{esc(e)}</code>", parse_mode='html')
 
-    # ── SCHEDULER LOOP (Option A) ───────────────────────────────────────────────
+    # ── SCHEDULER LOOP with per-chat idempotency ───────────────────────────────
     async def scheduler_loop():
         log.info("Scheduler loop started.")
         while True:
             try:
-                now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
                 # Fetch all due, scheduled messages
                 due_cur = scheduled_coll.find({
-                    "status": {"$in": ["scheduled", None]},
+                    "status": {"$in": ["scheduled", None, "processing"]},
                     "scheduledAt": {"$lte": now_utc}
-                })
+                }).limit(50)
 
                 for msg in due_cur:
                     msg_id = msg.get("_id")
                     try:
-                        # Mark "processing" to avoid double send if loop iteration overlaps
-                        scheduled_coll.update_one({"_id": msg_id, "status": {"$in": ["scheduled", None]}},
-                                                  {"$set": {"status": "processing"}})
+                        # Mark processing (idempotent)
+                        scheduled_coll.update_one(
+                            {"_id": msg_id},
+                            {"$set": {"status": "processing"}}
+                        )
 
                         # Normalize scheduledAt type if it's string
                         try:
@@ -606,30 +772,59 @@ async def main():
                             scheduled_coll.update_one({"_id": msg_id}, {"$set": {"status": "failed", "lastError": "Invalid scheduledAt"}})
                             continue
 
-                        # Determine targets
-                        targets = msg.get("targets", "all")
-                        if targets == "all":
-                            chat_ids = [d["chatId"] for d in chats_coll.find({"isActive": True}, {"chatId": 1})]
+                        # Determine targets: explicit > all-active-non-user
+                        explicit_ids = msg.get("targetChatIds") or []
+                        if explicit_ids:
+                            chat_ids = sorted(set(int(x) for x in explicit_ids))
+                        elif msg.get("targets", "all") == "all":
+                            chat_ids = [
+                                d["chatId"]
+                                for d in chats_coll.find(
+                                    {"isActive": True, "type": {"$ne": "user"}},
+                                    {"chatId": 1, "type": 1}
+                                )
+                            ]
                         else:
-                            chat_ids = list(targets or [])
-
-                        if not chat_ids:
-                            log.info("No active chats found for message %s; marking sent.", msg_id)
-                            scheduled_coll.update_one({"_id": msg_id}, {"$set": {"status": "sent", "deliveredTo": []}})
-                            continue
+                            chat_ids = []
 
                         delivered = []
                         for cid in chat_ids:
+                            # Per-chat claim-before-send (unique (schedId, chatId))
+                            try:
+                                res = deliveries_coll.update_one(
+                                    {"schedId": msg_id, "chatId": cid},
+                                    {"$setOnInsert": {"claimedAt": now_utc}},
+                                    upsert=True
+                                )
+                                # If document existed already (no upsert), skip to avoid duplicates
+                                if not res.upserted_id:
+                                    continue
+                            except Exception as e:
+                                log.warning("Claim (schedId=%s, chatId=%s) failed: %s", msg_id, cid, e)
+                                continue
+
+                            # Perform the send
                             try:
                                 ids = await post_scheduled_message(client, cid, msg)
                                 delivered.append({"chatId": cid, "messageIds": ids})
+                                deliveries_coll.update_one(
+                                    {"schedId": msg_id, "chatId": cid},
+                                    {"$set": {"sentAt": datetime.now(timezone.utc), "messageIds": ids, "error": None}}
+                                )
                             except Exception as e:
                                 log.warning("Sending to chat %s failed: %s", cid, e)
+                                deliveries_coll.update_one(
+                                    {"schedId": msg_id, "chatId": cid},
+                                    {"$set": {"sentAt": None, "error": str(e)}}
+                                )
                                 # Optionally deactivate chat on permanent errors
                                 # chats_coll.update_one({"chatId": cid}, {"$set": {"isActive": False, "lastError": str(e)}})
 
-                        scheduled_coll.update_one({"_id": msg_id}, {"$set": {"status": "sent", "deliveredTo": delivered}})
-                        log.info("Message %s sent to %d chats", msg_id, len(delivered))
+                        scheduled_coll.update_one(
+                            {"_id": msg_id},
+                            {"$set": {"status": "sent", "deliveredTo": delivered}}
+                        )
+                        log.info("Message %s processed; deliveries: %d", msg_id, len(delivered))
 
                     except Exception as e:
                         log.exception("Error processing scheduled message %s: %s", msg_id, e)
