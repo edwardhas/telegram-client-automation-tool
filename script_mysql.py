@@ -184,7 +184,6 @@ def parse_insert_args_v2(text: str) -> Optional[Tuple[str, str, List[str], str, 
     if m:
         groups_blob = m.group(1)
         trailing = trailing[:m.start()].strip()  # remove groups=[...] from time part
-        # split by commas
         for g in groups_blob.split(","):
             g = g.strip()
             if not g:
@@ -264,10 +263,9 @@ async def send_text_safe(client: TelegramClient, chat_id: int, text: str, *, par
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
 
-# ---------- NEW: robust album sender with local downloads ----------
+# ---------- NEW: robust album sender with local downloads + upload ----------
 async def _download_one(url: str, dest_dir: str) -> Optional[str]:
     """Download a single image to dest_dir. Returns path or None on failure."""
-    # crude ext guess to hint Telegram it's a photo
     guess = url.split("?")[0].lower()
     ext = ".jpg"
     for e in (".jpg", ".jpeg", ".png", ".webp"):
@@ -278,9 +276,8 @@ async def _download_one(url: str, dest_dir: str) -> Optional[str]:
     path = os.path.join(dest_dir, filename)
 
     try:
-        # try aiohttp first
         import aiohttp  # type: ignore
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=25)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
@@ -290,10 +287,9 @@ async def _download_one(url: str, dest_dir: str) -> Optional[str]:
                     f.write(data)
         return path
     except Exception as e:
-        # fallback to urllib
         try:
             import urllib.request
-            with urllib.request.urlopen(url, timeout=20) as r:
+            with urllib.request.urlopen(url, timeout=25) as r:
                 data = r.read()
                 with open(path, "wb") as f:
                     f.write(data)
@@ -301,6 +297,43 @@ async def _download_one(url: str, dest_dir: str) -> Optional[str]:
         except Exception as e2:
             log.warning("Download failed for %s: %s / %s", url, e, e2)
             return None
+
+def _ensure_photo_jpeg(src_path: str, dest_dir: str) -> Optional[str]:
+    """
+    Try to make sure Telegram treats it as a photo:
+    - If Pillow available: open, convert to RGB, save as JPEG (quality=85)
+    - Else: return original path
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return src_path
+    try:
+        with Image.open(src_path) as im:
+            # small safety: reject obviously non-image
+            im.verify()
+        with Image.open(src_path) as im2:
+            if im2.mode not in ("RGB", "L"):
+                im2 = im2.convert("RGB")
+            out_name = hashlib.md5(src_path.encode("utf-8")).hexdigest() + ".jpg"
+            out_path = os.path.join(dest_dir, out_name)
+            im2.save(out_path, format="JPEG", quality=85, optimize=True)
+            return out_path
+    except Exception as e:
+        log.warning("Pillow re-encode failed for %s: %s", src_path, e)
+        return src_path
+
+async def _upload_all(client: TelegramClient, paths: List[str]):
+    """
+    Upload files to Telegram to ensure they're photos, not documents.
+    Returns a list of UploadFile objects.
+    """
+    uploaded = []
+    for p in paths:
+        await throttle()
+        uf = await client.upload_file(p, file_name=os.path.basename(p))
+        uploaded.append(uf)
+    return uploaded
 
 async def send_files_safe(
     client: TelegramClient,
@@ -312,35 +345,43 @@ async def send_files_safe(
 ):
     """
     Force a single grouped post (album) whenever there are multiple images:
-    1) Download up to 10 images to local temp files (Telegram groups local photos reliably).
-    2) Send all at once so Telegram creates an album with caption on the first media.
-    3) If that fails, retry with remote URLs list.
-    4) Final fallback: text + links (last resort).
+    1) Download up to 10 images to local temp files.
+    2) Re-encode to JPEG (if Pillow available) to guarantee 'photo' type.
+    3) Upload all first; then send as one album with caption on the first media.
+    4) If that fails, retry with raw URLs list.
+    5) Final fallback: text + links.
     """
     if not files:
         return []
 
-    # Telegram album limit = 10
-    files = files[:10]
+    files = files[:10]  # Telegram album limit
 
-    # 1) Try local downloads
     tmpdir = tempfile.mkdtemp(prefix="tg_album_")
     local_paths: List[str] = []
+    prepared_paths: List[str] = []
     try:
+        # 1) Download
         for u in files:
             p = await _download_one(u, tmpdir)
             if p:
                 local_paths.append(p)
 
-        if len(local_paths) == len(files) and len(local_paths) > 1:
+        # We want all of them; otherwise albums can fail. If any missing, still try with what we have.
+        if len(local_paths) >= 2:
+            # 2) Re-encode to JPEG for consistency
+            for p in local_paths:
+                prepared_paths.append(_ensure_photo_jpeg(p, tmpdir) or p)
+
             try:
+                # 3) Upload first to ensure Telegram sees them as photos
+                uploaded = await _upload_all(client, prepared_paths)
                 await throttle()
                 result = await client.send_file(
                     chat_id,
-                    local_paths,
+                    uploaded,
                     caption=caption,
                     parse_mode=parse_mode,
-                    force_document=False  # prefer photos
+                    force_document=False
                 )
                 if isinstance(result, list):
                     return [m.id for m in result]
@@ -348,9 +389,10 @@ async def send_files_safe(
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 1)
                 await throttle()
+                uploaded = await _upload_all(client, prepared_paths)
                 result = await client.send_file(
                     chat_id,
-                    local_paths,
+                    uploaded,
                     caption=caption,
                     parse_mode=parse_mode,
                     force_document=False
@@ -359,9 +401,9 @@ async def send_files_safe(
                     return [m.id for m in result]
                 return [result.id]
             except Exception as e:
-                log.warning("Local album send failed for chat %s: %s. Will retry with URLs.", chat_id, e)
+                log.warning("Uploaded album send failed for chat %s: %s. Will retry with URLs.", chat_id, e)
 
-        # 2) Retry with URLs list (Telethon should still group if all are valid photos)
+        # 4) Retry with URL list (may still group if Telegram accepts them)
         try:
             await throttle()
             result = await client.send_file(
@@ -388,7 +430,7 @@ async def send_files_safe(
                 return [m.id for m in result]
             return [result.id]
         except Exception as e:
-            # 3) Final fallback: at least deliver something
+            # 5) Final fallback: text + links (last resort)
             log.warning("URL album send failed for chat %s: %s. Falling back to text+links.", chat_id, e)
             ids = []
             if caption:
@@ -399,11 +441,10 @@ async def send_files_safe(
     finally:
         # cleanup temp files
         try:
-            for p in local_paths:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+            # remove all files we created
+            for p in set(local_paths + prepared_paths):
+                try: os.remove(p)
+                except Exception: pass
             os.rmdir(tmpdir)
         except Exception:
             pass
@@ -481,10 +522,8 @@ async def post_scheduled_message(client: TelegramClient, chat_id: int, msg_doc: 
     disable_preview = bool(msg_doc.get("disablePreview", True))
 
     if images:
-        # ONE grouped post: album with caption on first media
         return await send_files_safe(client, chat_id, images, caption=text if text else None, parse_mode=parse_mode or 'html')
     else:
-        # text-only
         return await send_text_safe(client, chat_id, text, parse_mode=parse_mode or 'html', link_preview=not disable_preview)
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -608,7 +647,7 @@ async def main():
             " • /update <object_id> <name> <description> <url>\n"
             " • /delete <object_id>\n\n"
             "Admin:\n"
-            " • /here   (run this inside a group/channel to register it)\n"
+            " • /here   (run this inside a group to register it)\n"
             " • /groups_add [ -1001 -1002 ]\n"
             " • /groups_list\n\n"
             "Automation: campaigns in 'scheduled_messages' are sent to explicit targetChatIds or to all active chats.",
@@ -785,7 +824,6 @@ async def main():
         local_time = scheduled_utc.astimezone(SERVICE_TZ).strftime("%Y-%m-%d %H:%M %Z")
         utc_time = scheduled_utc.strftime("%Y-%m-%d %H:%M UTC")
         if resolved_chat_ids:
-            # show up to 10 ids to keep it tidy
             preview = ", ".join(str(c) for c in resolved_chat_ids[:10])
             suffix = "" if len(resolved_chat_ids) <= 10 else f" …(+{len(resolved_chat_ids)-10} more)"
             targets_line = f"targets: {len(resolved_chat_ids)} chats [{preview}{suffix}]"
@@ -903,7 +941,6 @@ async def main():
                                     {"$setOnInsert": {"claimedAt": now_utc}},
                                     upsert=True
                                 )
-                                # If document existed already (no upsert), skip to avoid duplicates
                                 if not res.upserted_id:
                                     continue
                             except Exception as e:
