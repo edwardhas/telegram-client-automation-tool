@@ -1,0 +1,11 @@
+boto3==1.26.14
+tzdata==2023.3
+configparser==7.2.0
+dnspython==2.6.1
+pyaes==1.6.1
+pyasn1==0.6.1
+pymongo==4.15.3
+python-dateutil==2.9.0.post0
+rsa==4.9.1
+six==1.17.0
+Telethon==1.41.2
