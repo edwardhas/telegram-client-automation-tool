@@ -1,11 +1,17 @@
-boto3==1.26.14
-tzdata==2023.3
-configparser==7.2.0
+# Core runtime
+telethon==1.36.0
+
+# MongoDB (+ SRV support for mongodb+srv URIs)
+pymongo==4.8.0
 dnspython==2.6.1
-pyaes==1.6.1
-pyasn1==0.6.1
-pymongo==4.15.3
+
+# Dates, time parsing, and time zones
 python-dateutil==2.9.0.post0
-rsa==4.9.1
-six==1.17.0
-Telethon==1.41.2
+tzdata>=2024.1
+
+# Networking + HTTP client (for image downloads)
+aiohttp==3.10.5
+certifi>=2024.6.2
+
+# Images (JPEG/WebP capable wheels on Linux)
+pillow==10.4.0
