@@ -8,7 +8,7 @@ Steps:
        API_ID=123456
        API_HASH=abcdef0123456789abcdef0123456789
   3) Run: python session_string_generator.py
-  4) Enter your phone/code (and 2FA if enabled). Copy the printed string.
+  4) Enter your phone/code (and 2FA if enabled). Copy the printed string and paste into .env variable as SESSION_STRING.
 """
 
 import os
