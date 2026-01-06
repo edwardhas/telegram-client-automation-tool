@@ -1,51 +1,29 @@
-# Telegram Automation Refactor (Mongo-only + API + Vue 3 Admin)
+# Telegram Automation Tool (MongoDB + API + Vue 3 Admin)
 
-This refactor splits your current all-in-one Telethon script into three clean parts:
+This version splits the Internal-Control-v1-0.0.0 Telethon script into three main parts:
 
-- **worker/**: Telethon “sender” service (discovers chats + executes due scheduled messages)
-- **backend/**: FastAPI REST API (CRUD + deliveries + templates)
-- **web/**: Vue 3 admin UI (form-based scheduling)
+- **worker/**: Telethon “sender” service (discovers chats + executes due scheduled messages, works with Telegram directly)
+- **backend/**: FastAPI REST API (Create/Read/Update/Delete Operations + deliveries + templates)
+- **web/** */: Vue 3 admin UI (task scheduling + management + monitoring)
 
-## Why this is easier to manage
+## Why this is better than Internal-Control-v1-0.0.0
 
-- You stop relying on complex Telegram command parsing (`/insert`, `/save`, `/done`) and instead schedule everything through a **single source of truth**: `scheduled_messages` in MongoDB.
+- Stop relying on Telegram command parsing (`/insert`, `/save`, `/done`) and instead schedule everything through a **single source of truth**: `scheduled_messages` in MongoDB.
 - The worker becomes small and purpose-built: *“read due jobs from Mongo, send, log deliveries.”*
-- The UI gives you a real CRUD workflow (list, create, run-now, delete) without touching bot code.
+- The UI gives you a real CRUD workflow (list, create, run, delete) without touching bot code.
 
-## Mongo-only?
-
-Yes — this design uses **MongoDB as the only database**.
-
-**Recommendation:** Mongo-only is totally fine here.
-- ✅ Great fit for job documents, delivery logs, and campaign templates
-- ✅ Easy to index + query for “due jobs”
-- ⚠️ Make sure you keep the right indexes (already created in `backend/db.py` and `worker/worker.py`)
 
 ## Collections used
 
-- `chats` – discovered group/channel chat IDs (negative `-100...`)
+- `chats` – discovered group/channel chat IDs (in Telegram it is usually negative numbers `-100...`)
 - `scheduled_messages` – scheduled jobs (one-time or cron)
 - `deliveries` – per-chat send log (deduped by `(scheduledId, chatId)`)
 - `saved_campaigns` – optional templates
 
-(Your existing `Announcements` collection is left alone; you can keep it if it’s useful for a content library.)
-
 ## Setup
 
-### 1) Run the worker
 
-The worker requires a **Telethon user session** (StringSession), and MongoDB connection.
-
-```bash
-cd worker
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# edit .env
-python worker.py
-```
-
-### 2) Run the API
+### 1) Run the Backend API
 
 ```bash
 cd backend
@@ -59,7 +37,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 3) Run the Vue 3 UI
+
+### 2) Run the Vue 3 Control WebSite
 
 ```bash
 cd web
@@ -70,21 +49,25 @@ npm run dev
 
 Open the UI at `http://localhost:5173`, go to **Settings**, and paste the same `ADMIN_TOKEN` from the backend.
 
-## Migration notes for your current DB
 
-Your current `config.ini` has non-standard collection names:
-- `scheduled_collection = schedules_messages`
-- `saved_collection = saved_compaigns`
 
-In this refactor I standardized these to:
-- `scheduled_messages`
-- `saved_campaigns`
+### 3) Run the worker
 
-If you want to keep your existing names (no rename), just change the collection env vars in `backend/.env` and `worker/.env`.
+The worker requires a **Telethon user session** (StringSession), and MongoDB connection.
 
-## Security notes (important)
+**session_string_generator.py**
+Generates a Telethon StringSession for your PERSONAL Telegram account.
 
-- Keep the API behind a firewall / VPN if possible.
-- If you expose it publicly, add HTTPS + strong auth (token rotation, rate limits, optional IP allowlist).
-- Do **not** commit your `.env` files.
+Steps:
+  1) Install: pip install telethon
+  2) Run: python session_string_generator.py
+  3) Enter your phone & code that you will receive in your Telegram App (and 2FA if enabled). Copy the printed string and paste into .env variable as SESSION_STRING.
 
+```bash
+cd worker
+python -m venv .venv 
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python worker.py
+```
