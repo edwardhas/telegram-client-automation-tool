@@ -267,7 +267,8 @@ function parseImages() {
 
 function parseChatIds() {
   const ids = chatIdsRaw.value
-    .split(',')
+    // allow comma-separated or newline-separated lists
+    .split(/[\s,]+/)
     .map(s => s.trim())
     .filter(Boolean)
     .map(s => Number(s))
@@ -280,8 +281,15 @@ async function submit() {
   ok.value = false
 
   parseImages()
-  if (form.targets === 'custom') parseChatIds()
-  else form.targetChatIds = []
+  if (form.targets === 'custom') {
+    parseChatIds()
+    if (!form.targetChatIds.length) {
+      error.value = 'Please provide at least one chat ID (comma or newline separated).'
+      return
+    }
+  } else {
+    form.targetChatIds = []
+  }
 
   if (!form.title) {
     error.value = 'Title is required.'
@@ -290,11 +298,12 @@ async function submit() {
 
   const payload = {
     title: form.title,
-    text: form.text,
-    images: form.images,
+    // Backend uses "description" as the message body (HTML/Markdown/None)
+    description: form.text,
+    imageUrls: form.images,
     parseMode: form.parseMode,
     disablePreview: form.disablePreview,
-    targets: form.targets,
+    targetsMode: form.targets === 'custom' ? 'explicit' : 'all',
     targetChatIds: form.targets === 'custom' ? form.targetChatIds : [],
     scheduleType: form.scheduleType,
     tz: form.tz,

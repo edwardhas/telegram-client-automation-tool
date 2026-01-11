@@ -12,7 +12,7 @@
     <div v-if="error" class="alert error">{{ error }}</div>
 
     <div class="grid">
-      <div v-for="m in messages" :key="m.id" class="card">
+      <div v-for="m in messagesSafe" :key="m.id" class="card">
         <div class="cardHead">
           <div>
             <div class="title">{{ m.title }}</div>
@@ -47,41 +47,38 @@
         <div class="row">
           <div class="k">Targets</div>
           <div class="v">
-            <span v-if="m.targets === 'all'">all chats</span>
-            <span v-else>custom: {{ (m.targetChatIds || []).join(', ') }}</span>
+            <span v-if="m.targetsMode === 'all'">all chats</span>
+            <span v-else>explicit: {{ (m.targetChatIds || []).join(', ') }}</span>
           </div>
         </div>
 
         <div class="row">
           <div class="k">Text</div>
-          <div class="v pre">{{ m.text }}</div>
+          <div class="v pre">{{ m.description }}</div>
         </div>
 
-        <div class="row" v-if="m.images && m.images.length">
+        <div class="row" v-if="m.imageUrls && m.imageUrls.length">
           <div class="k">Images</div>
           <div class="v">
-            <div v-for="(u, idx) in m.images" :key="idx" class="imgLine">
+            <div v-for="(u, idx) in m.imageUrls" :key="idx" class="imgLine">
               <a :href="u" target="_blank" rel="noreferrer">{{ u }}</a>
             </div>
           </div>
         </div>
       </div>
 
-      <div v-if="loading" class="card">
-        Loading...
-      </div>
-      <div v-if="!loading && !messages.length" class="card">
-        No messages yet.
-      </div>
+      <div v-if="loading" class="card">Loading...</div>
+      <div v-else-if="!messagesSafe.length" class="card">No messages yet.</div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import client from '../api/client'
 
 const messages = ref([])
+const messagesSafe = computed(() => (Array.isArray(messages.value) ? messages.value : []))
 const loading = ref(false)
 const error = ref('')
 
@@ -138,9 +135,13 @@ async function refresh() {
   loading.value = true
   try {
     const res = await client.get('/api/messages?limit=100&skip=0')
-    messages.value = res.data
+    // API returns an array. (Older clients used {data: [...]})
+    if (Array.isArray(res)) messages.value = res
+    else if (Array.isArray(res?.data)) messages.value = res.data
+    else messages.value = []
   } catch (e) {
     error.value = e?.response?.data?.detail || e?.message || 'Failed to load'
+    messages.value = []
   } finally {
     loading.value = false
   }

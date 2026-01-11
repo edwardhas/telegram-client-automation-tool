@@ -31,7 +31,6 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # edit .env (set ADMIN_TOKEN)
-uvicorn main:app --host 0.0.0.0 --port 8000
 
 !! after everything is configured - run the following code from the root:
 python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
