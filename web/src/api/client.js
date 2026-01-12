@@ -1,64 +1,58 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+// web/src/api/client.js
+
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+const TOKEN_KEY = "ADMIN_TOKEN";
 
 export function getAdminToken() {
-  return localStorage.getItem('adminToken') || ''
+  return localStorage.getItem(TOKEN_KEY) || "";
 }
 
 export function setAdminToken(token) {
-  localStorage.setItem('adminToken', token || '')
+  const t = (token || "").trim();
+  if (!t) localStorage.removeItem(TOKEN_KEY);
+  else localStorage.setItem(TOKEN_KEY, t);
 }
 
 async function request(path, opts = {}) {
-  const headers = { ...(opts.headers || {}) }
+  const url = path.startsWith("http") ? path : `${API_BASE}${path}`;
+  const headers = {
+    ...(opts.headers || {}),
+  };
 
-  // Only set JSON content-type when body is not FormData
-  const isFormData = typeof FormData !== 'undefined' && opts.body instanceof FormData
-  if (!isFormData && !headers['Content-Type']) {
-    headers['Content-Type'] = 'application/json'
+  // If sending JSON body, ensure Content-Type
+  if (opts.body && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
   }
 
-  const token = getAdminToken()
-  if (token) headers['X-Admin-Token'] = token
+  const token = getAdminToken();
+  if (token) headers["X-Admin-Token"] = token;
 
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers })
+  const res = await fetch(url, { ...opts, headers });
+
+  // Try to parse JSON if possible
+  const contentType = res.headers.get("content-type") || "";
+  const isJson = contentType.includes("application/json");
+  const data = isJson ? await res.json().catch(() => null) : await res.text().catch(() => "");
 
   if (!res.ok) {
-    let msg = `HTTP ${res.status}`
-    try {
-      const body = await res.json()
-      msg = body.detail || JSON.stringify(body)
-    } catch (_) {
-      // ignore
-    }
-    throw new Error(msg)
+    const msg =
+      (data && typeof data === "object" && (data.detail || data.message)) ||
+      (typeof data === "string" && data) ||
+      `Request failed: ${res.status}`;
+    throw new Error(msg);
   }
 
-  if (res.status === 204) return null
-  return res.json()
+  return data;
 }
 
-/**
- * Universal client:
- * - client.get(...)
- * - client() -> returns itself so client().get(...) works
- * - client(path, opts) -> direct request
- */
-function client(path, opts) {
-  if (!path) return client
-  return request(path, opts)
-}
+// api object
+export const api = {
+  get: (path) => request(path, { method: "GET" }),
+  post: (path, body) => request(path, { method: "POST", body: JSON.stringify(body) }),
+  put: (path, body) => request(path, { method: "PUT", body: JSON.stringify(body) }),
+  patch: (path, body) => request(path, { method: "PATCH", body: JSON.stringify(body) }),
+  del: (path) => request(path, { method: "DELETE" }),
+};
 
-client.get = (path) => request(path, { method: 'GET' })
-client.post = (path, body) =>
-  request(path, { method: 'POST', body: body instanceof FormData ? body : JSON.stringify(body) })
-client.put = (path, body) =>
-  request(path, { method: 'PUT', body: body instanceof FormData ? body : JSON.stringify(body) })
-client.del = (path) => request(path, { method: 'DELETE' })
-
-// expose helpers too
-client.api = request
-client.getAdminToken = getAdminToken
-client.setAdminToken = setAdminToken
-
-export const api = request
-export default client
+// default export for older imports: import api from '../api/client'
+export default api;

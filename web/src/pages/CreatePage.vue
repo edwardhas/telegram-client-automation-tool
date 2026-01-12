@@ -10,7 +10,7 @@
 
       <div class="row">
         <label>Text (HTML allowed)</label>
-        <textarea v-model="form.text" rows="6" placeholder="Message body"></textarea>
+        <textarea v-model="form.description" rows="6" placeholder="Message body"></textarea>
       </div>
 
       <div class="row">
@@ -41,12 +41,12 @@
       <div class="row two">
         <div>
           <label>Targets</label>
-          <select v-model="form.targets">
+          <select v-model="form.targetsMode">
             <option value="all">All chats</option>
             <option value="custom">Custom chat IDs</option>
           </select>
         </div>
-        <div v-if="form.targets === 'custom'">
+        <div v-if="form.targetsMode === 'custom'">
           <label>Chat IDs (comma separated)</label>
           <input v-model.trim="chatIdsRaw" placeholder="-100123, 3159..." />
         </div>
@@ -176,11 +176,11 @@ const ok = ref(false)
 
 const form = reactive({
   title: '',
-  text: '',
-  images: [],
+  description: '',
+  imageUrls: [],
   parseMode: 'HTML',
   disablePreview: true,
-  targets: 'all',
+  targetsMode: 'all',
   targetChatIds: [],
   scheduleType: 'once',
   runAt: null,
@@ -262,13 +262,12 @@ function parseImages() {
     .split('\n')
     .map(s => s.trim())
     .filter(Boolean)
-  form.images = lines
+  form.imageUrls = lines
 }
 
 function parseChatIds() {
   const ids = chatIdsRaw.value
-    // allow comma-separated or newline-separated lists
-    .split(/[\s,]+/)
+    .split(',')
     .map(s => s.trim())
     .filter(Boolean)
     .map(s => Number(s))
@@ -281,15 +280,8 @@ async function submit() {
   ok.value = false
 
   parseImages()
-  if (form.targets === 'custom') {
-    parseChatIds()
-    if (!form.targetChatIds.length) {
-      error.value = 'Please provide at least one chat ID (comma or newline separated).'
-      return
-    }
-  } else {
-    form.targetChatIds = []
-  }
+  if (form.targetsMode === 'custom') parseChatIds()
+  else form.targetChatIds = []
 
   if (!form.title) {
     error.value = 'Title is required.'
@@ -298,13 +290,12 @@ async function submit() {
 
   const payload = {
     title: form.title,
-    // Backend uses "description" as the message body (HTML/Markdown/None)
-    description: form.text,
-    imageUrls: form.images,
+    description: form.description,
+    imageUrls: form.imageUrls,
     parseMode: form.parseMode,
     disablePreview: form.disablePreview,
-    targetsMode: form.targets === 'custom' ? 'explicit' : 'all',
-    targetChatIds: form.targets === 'custom' ? form.targetChatIds : [],
+    targetsMode: form.targetsMode,
+    targetChatIds: form.targetsMode === 'custom' ? form.targetChatIds : [],
     scheduleType: form.scheduleType,
     tz: form.tz,
   }
@@ -332,7 +323,7 @@ async function submit() {
 
     // reset a few fields
     form.title = ''
-    form.text = ''
+    form.description = ''
     imagesRaw.value = ''
     chatIdsRaw.value = ''
     runAtLocal.value = ''

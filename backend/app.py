@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
 from bson import ObjectId
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from .db import ensure_indexes, get_db
@@ -20,8 +20,30 @@ from .models import (
     ScheduledMessageUpdate,
 )
 from .scheduling import compute_next_run_at
-from .security import require_admin
 from .settings import settings
+
+
+# ---- Auth ----
+
+def require_admin(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> None:
+    """Simple admin auth using a shared token.
+
+    The UI sends X-Admin-Token header. If it doesn't match ADMIN_TOKEN -> 401.
+    """
+    if not settings.ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ADMIN_TOKEN is not configured on the server",
+        )
+
+    if x_admin_token != settings.ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+        )
+
 
 
 def _local_input_to_utc(dt: datetime | None, tz_name: str) -> datetime | None:

@@ -1,283 +1,343 @@
 <template>
   <div class="page">
-    <div class="head">
+    <header class="header">
       <h1>Dashboard</h1>
-      <div class="actions">
-        <button class="btn" @click="refresh" :disabled="loading">Refresh</button>
+      <div class="tabs">
+        <button
+          class="tab"
+          :class="{ active: tab === 'scheduled' }"
+          @click="setTab('scheduled')"
+        >
+          Scheduled
+        </button>
+        <button
+          class="tab"
+          :class="{ active: tab === 'history' }"
+          @click="setTab('history')"
+        >
+          History
+        </button>
       </div>
+    </header>
+
+    <div v-if="error" class="error">
+      {{ error }}
     </div>
 
-    <p class="hint">Shows the newest scheduled messages in the database.</p>
+    <div v-if="loading" class="loading">Loading…</div>
 
-    <div v-if="error" class="alert error">{{ error }}</div>
+    <div v-else>
+      <!-- Scheduled -->
+      <section v-if="tab === 'scheduled'">
+        <div v-if="scheduled.length === 0" class="empty">
+          No scheduled messages yet.
+        </div>
 
-    <div class="grid">
-      <div v-for="m in messagesSafe" :key="m.id" class="card">
-        <div class="cardHead">
-          <div>
-            <div class="title">{{ m.title }}</div>
-            <div class="meta">
-              <span class="chip">{{ m.status }}</span>
-              <span class="chip" v-if="m.enabled">enabled</span>
-              <span class="chip" v-else>disabled</span>
+        <div v-else class="list">
+          <article v-for="m in scheduled" :key="m._id" class="card color-black">
+            <div class="row">
+              <div>
+                <div class="title">{{ m.title }}</div>
+                <div class="meta">
+                  <span class="pill">{{ m.status || 'scheduled' }}</span>
+                  <span class="meta-item">Next: <b>{{ fmtWhen(m.nextRunAt, m.tz) }}</b></span>
+                  <span v-if="m.scheduleType === 'cron' && m.endAt" class="meta-item">
+                    End: <b>{{ fmtWhen(m.endAt, m.tz) }}</b>
+                  </span>
+                </div>
+              </div>
+
+              <div class="actions">
+                <button class="btn color-black" @click="runNow(m)" :disabled="busyId === m._id">Run now</button>
+                <button class="btn" @click="toggleEnabled(m)" :disabled="busyId === m._id">
+                  {{ m.enabled ? 'Disable' : 'Enable' }}
+                </button>
+                <button class="btn danger color-black" @click="deleteMsg(m)" :disabled="busyId === m.id">Delete</button>
+              </div>
             </div>
-          </div>
-          <div class="right">
-            <button class="btn small" @click="runNow(m.id)">Run now</button>
-          </div>
-        </div>
 
-        <div class="row">
-          <div class="k">Schedule</div>
-          <div class="v">
-            <div>{{ scheduleLabel(m) }}</div>
-            <div class="sub" v-if="m.scheduleType === 'cron'">
-              cron: <code>{{ m.cron }}</code>
+            <div v-if="m.description" class="body" v-html="m.description"></div>
+
+            <div v-if="(m.imageUrls || []).length" class="images">
+              <a v-for="(u, idx) in m.imageUrls" :key="idx" :href="u" target="_blank" rel="noreferrer">
+                {{ shortUrl(u) }}
+              </a>
             </div>
-            <div class="sub" v-if="m.endAt">ends: {{ fmtUtc(m.endAt) }}</div>
-            <div class="sub">tz: {{ m.tz }}</div>
-          </div>
-        </div>
 
-        <div class="row">
-          <div class="k">Next run</div>
-          <div class="v">{{ m.nextRunAt ? fmtUtc(m.nextRunAt) : '—' }}</div>
-        </div>
-
-        <div class="row">
-          <div class="k">Targets</div>
-          <div class="v">
-            <span v-if="m.targetsMode === 'all'">all chats</span>
-            <span v-else>explicit: {{ (m.targetChatIds || []).join(', ') }}</span>
-          </div>
-        </div>
-
-        <div class="row">
-          <div class="k">Text</div>
-          <div class="v pre">{{ m.description }}</div>
-        </div>
-
-        <div class="row" v-if="m.imageUrls && m.imageUrls.length">
-          <div class="k">Images</div>
-          <div class="v">
-            <div v-for="(u, idx) in m.imageUrls" :key="idx" class="imgLine">
-              <a :href="u" target="_blank" rel="noreferrer">{{ u }}</a>
+            <div class="meta2">
+              <div>
+                Targets:
+                <b v-if="m.targetsMode === 'all'">All chats</b>
+                <b v-else>Specific chats</b>
+                <span v-if="m.targetsMode !== 'all' && (m.targetChatIds || []).length" class="muted">
+                  ({{ (m.targetChatIds || []).join(', ') }})
+                </span>
+              </div>
+              <div class="muted">Created: {{ fmtWhen(m.createdAt, m.tz) }}</div>
             </div>
-          </div>
+          </article>
         </div>
-      </div>
+      </section>
 
-      <div v-if="loading" class="card">Loading...</div>
-      <div v-else-if="!messagesSafe.length" class="card">No messages yet.</div>
+      <!-- History -->
+      <section v-else>
+        <div class="toolbar">
+          <label class="muted">
+            Show:
+            <select v-model="historyFilter" @change="load()">
+              <option value="all">All</option>
+              <option value="done">Done</option>
+              <option value="ended">Ended</option>
+              <option value="error">Error</option>
+              <option value="no_targets">No targets</option>
+            </select>
+          </label>
+        </div>
+
+        <div v-if="history.length === 0" class="empty">
+          No history yet.
+        </div>
+
+        <div v-else class="list">
+          <article v-for="m in history" :key="m._id" class="card">
+            <div class="row">
+              <div>
+                <div class="title">{{ m.title }}</div>
+                <div class="meta">
+                  <span class="pill">{{ m.status }}</span>
+                  <span v-if="m.lastRunAt" class="meta-item">Last run: <b>{{ fmtWhen(m.lastRunAt, m.tz) }}</b></span>
+                  <span v-else-if="m.nextRunAt" class="meta-item">Next: <b>{{ fmtWhen(m.nextRunAt, m.tz) }}</b></span>
+                </div>
+              </div>
+
+              <div class="actions">
+                <button class="btn" @click="openRerun(m)" :disabled="busyId === m._id">Run again</button>
+                <button class="btn danger" @click="deleteMsg(m)" :disabled="busyId === m._id">Delete</button>
+              </div>
+            </div>
+
+            <div v-if="m.status === 'error' && m.error" class="errorbox">
+              {{ m.error }}
+            </div>
+
+
+            <div v-if="m.description" class="body" v-html="m.description"></div>
+
+            <div v-if="(m.imageUrls || []).length" class="images">
+              <a v-for="(u, idx) in m.imageUrls" :key="idx" :href="u" target="_blank" rel="noreferrer">
+                {{ shortUrl(u) }}
+              </a>
+            </div>
+
+            <div v-if="rerunOpenId === m.id" class="rerun">
+              <div class="muted">Pick a time to run this message again:</div>
+              <div class="rerun-row">
+                <input type="datetime-local" v-model="rerunAt" />
+                <button class="btn" @click="confirmRerun(m)" :disabled="busyId === m.id || !rerunAt">
+                  Schedule
+                </button>
+                <button class="btn" @click="closeRerun()" :disabled="busyId === m.id">Cancel</button>
+              </div>
+            </div>
+
+            <div class="meta2">
+              <div class="muted">Created: {{ fmtWhen(m.createdAt, m.tz) }}</div>
+            </div>
+            <div class="meta2">
+              <div class="muted">Message ID: {{ fmtWhen(m._id) }}</div>
+            </div>
+          </article>
+        </div>
+      </section>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
-import client from '../api/client'
+import { ref, computed, onMounted } from 'vue'
+import { api } from '../api/client'
 
-const messages = ref([])
-const messagesSafe = computed(() => (Array.isArray(messages.value) ? messages.value : []))
+const tab = ref('scheduled')
 const loading = ref(false)
 const error = ref('')
+const busyId = ref(null)
 
-function fmtUtc(dt) {
-  try {
-    const d = new Date(dt)
-    return d.toISOString().replace('T', ' ').replace('Z', ' UTC')
-  } catch {
-    return String(dt)
+const messages = ref([])
+const historyFilter = ref('all')
+
+const rerunOpenId = ref(null)
+const rerunAt = ref('')
+
+const scheduled = computed(() => {
+  return (messages.value || []).filter((m) => m.enabled)
+})
+
+const history = computed(() => {
+  if (tab.value !== 'history') return []
+  let list = (messages.value || []).filter((m) => !m.enabled || ['done', 'ended', 'error', 'no_targets', 'sent'].includes(m.status))
+  if (historyFilter.value !== 'all') {
+    list = list.filter((m) => m.status === historyFilter.value)
   }
+  return list
+})
+
+function setTab(t) {
+  tab.value = t
+  // One list fetch is enough, but reload so filters apply fast if DB changed.
+  load()
 }
 
-function scheduleLabel(m) {
-  if (m.scheduleType === 'once') {
-    return `Once at ${m.runAt ? fmtUtc(m.runAt) : '—'}`
-  }
-
-  const cron = String(m.cron || '').trim()
-  const parts = cron.split(/\s+/)
-  if (parts.length !== 5) return 'Recurring'
-
-  const [min, hour, dom, mon, dow] = parts
-
-  // every N minutes
-  if (min.startsWith('*/') && hour === '*' && dom === '*' && mon === '*' && dow === '*') {
-    return `Every ${min.slice(2)} minutes`
-  }
-
-  // every N hours
-  if (min === '0' && hour.startsWith('*/') && dom === '*' && mon === '*' && dow === '*') {
-    return `Every ${hour.slice(2)} hours`
-  }
-
-  // daily
-  if (dom === '*' && mon === '*' && dow === '*') {
-    return `Daily at ${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`
-  }
-
-  // weekly
-  if (dom === '*' && mon === '*' && dow !== '*') {
-    return `Weekly on ${dow} at ${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`
-  }
-
-  // monthly
-  if (dom !== '*' && mon === '*' && dow === '*') {
-    return `Monthly on day ${dom} at ${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`
-  }
-
-  return 'Recurring'
+function shortUrl(u) {
+  if (!u) return ''
+  if (u.startsWith('http')) return u.replace(/^https?:\/\//, '').slice(0, 60) + (u.length > 60 ? '…' : '')
+  // local path: show tail
+  const parts = u.split('/')
+  return parts.slice(-2).join('/')
 }
 
-async function refresh() {
-  error.value = ''
+function fmtWhen(dt, tz) {
+  if (!dt) return '—'
+  const d = new Date(dt)
+  if (Number.isNaN(d.getTime())) return String(dt)
+
+  const now = new Date()
+  const sameDay = d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth()
+    && d.getDate() === now.getDate()
+
+  const opts = sameDay
+    ? { hour: 'numeric', minute: '2-digit', timeZone: tz || 'America/Los_Angeles' }
+    : { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: tz || 'America/Los_Angeles' }
+
+  return new Intl.DateTimeFormat(undefined, opts).format(d)
+}
+
+async function load() {
   loading.value = true
+  error.value = ''
   try {
-    const res = await client.get('/api/messages?limit=100&skip=0')
-    // API returns an array. (Older clients used {data: [...]})
-    if (Array.isArray(res)) messages.value = res
-    else if (Array.isArray(res?.data)) messages.value = res.data
-    else messages.value = []
+    // backend supports bucket=active/history/all. We want "all" so we can compute both tabs locally.
+    messages.value = await api.get('/api/messages?limit=200&bucket=all')
+    console.log(messages.value)
   } catch (e) {
-    error.value = e?.response?.data?.detail || e?.message || 'Failed to load'
+    console.error(e)
+    error.value = e?.message || 'Failed to load messages'
     messages.value = []
   } finally {
     loading.value = false
+    console.log(loading.value)
   }
 }
 
-async function runNow(id) {
+async function runNow(m) {
+  busyId.value = m.id
   error.value = ''
   try {
-    await client.post(`/api/messages/${id}/run`)
-    await refresh()
+    await api.post(`/api/messages/${m.id}/run`, {})
+    await load()
   } catch (e) {
-    error.value = e?.response?.data?.detail || e?.message || 'Failed to run'
+    console.error(e)
+    error.value = e?.message || 'Failed to run message'
+  } finally {
+    busyId.value = null
   }
 }
 
-onMounted(refresh)
+async function toggleEnabled(m) {
+  busyId.value = m.id
+  error.value = ''
+  try {
+    await api.patch(`/api/messages/${m.id}`, { enabled: !m.enabled })
+    await load()
+  } catch (e) {
+    console.error(e)
+    error.value = e?.message || 'Failed to update message'
+  } finally {
+    busyId.value = null
+  }
+}
+
+async function deleteMsg(m) {
+  if (!confirm('Delete this message?')) return
+  busyId.value = m.id
+  error.value = ''
+  try {
+    await api.del(`/api/messages/${m.id}`)
+    await load()
+  } catch (e) {
+    console.error(e)
+    error.value = e?.message || 'Failed to delete message'
+  } finally {
+    busyId.value = null
+  }
+}
+
+function openRerun(m) {
+  rerunOpenId.value = m.id
+  // default = now + 10 minutes (local)
+  const d = new Date(Date.now() + 10 * 60 * 1000)
+  // datetime-local wants "YYYY-MM-DDTHH:MM"
+  const pad = (n) => String(n).padStart(2, '0')
+  rerunAt.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function closeRerun() {
+  rerunOpenId.value = null
+  rerunAt.value = ''
+}
+
+async function confirmRerun(m) {
+  if (!rerunAt.value) return
+  busyId.value = m.id
+  error.value = ''
+  try {
+    await api.post(`/api/messages/${m.id}/clone`, {
+      scheduleType: 'once',
+      runAt: rerunAt.value,
+      tz: m.tz || 'America/Los_Angeles',
+      enabled: true,
+    })
+    closeRerun()
+    await load()
+    tab.value = 'scheduled'
+  } catch (e) {
+    console.error(e)
+    error.value = e?.message || 'Failed to schedule rerun'
+  } finally {
+    busyId.value = null
+  }
+}
+
+onMounted(load)
 </script>
 
 <style scoped>
-.page {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 24px;
-}
-
-.head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.actions {
-  display: flex;
-  gap: 8px;
-}
-
-.hint {
-  color: #6b7280;
-}
-
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-  gap: 14px;
-  margin-top: 14px;
-}
-
-.card {
-  background: #fff;
-  border: 1px solid #e5e7eb;
-  border-radius: 12px;
-  padding: 14px;
-  color: black;
-}
-
-.cardHead {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.title {
-  font-weight: 800;
-  font-size: 16px;
-}
-
-.meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.chip {
-  font-size: 12px;
-  border: 1px solid #e5e7eb;
-  border-radius: 999px;
-  padding: 2px 8px;
-  color: #374151;
-}
-
-.row {
-  display: grid;
-  grid-template-columns: 110px 1fr;
-  gap: 10px;
-  margin-top: 10px;
-}
-
-.k {
-  color: #6b7280;
-}
-
-.v {
-  color: #111827;
-}
-
-.sub {
-  color: #6b7280;
-  font-size: 12px;
-  margin-top: 4px;
-}
-
-.pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.imgLine {
-  margin-top: 4px;
-  overflow-wrap: anywhere;
-}
-
-.alert {
-  padding: 10px;
-  border-radius: 10px;
-  margin-top: 10px;
-}
-
-.alert.error {
-  border: 1px solid #fecaca;
-  background: #fef2f2;
-  color: #991b1b;
-}
-
-.btn {
-  border: 1px solid #d1d5db;
-  background: #fff;
-  border-radius: 10px;
-  padding: 8px 12px;
-  cursor: pointer;
-}
-
-.btn.small {
-  padding: 6px 10px;
-  font-size: 13px;
-}
+.page { padding: 16px; max-width: 1100px; margin: 0 auto; }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.tabs { display: flex; gap: 8px; }
+.tab { padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; background: #fff; cursor: pointer; }
+.tab.active { border-color: #111; }
+.loading { padding: 12px; }
+.error { background: #fee; border: 1px solid #fbb; padding: 10px; border-radius: 10px; margin: 10px 0; color:black}
+.errorbox { background: #fff5f5; border: 1px solid #fbb; padding: 10px; border-radius: 10px; margin-top: 10px; }
+.empty { padding: 18px; border: 1px dashed #ddd; border-radius: 12px; color: #666; }
+.list { display: grid; gap: 12px; }
+.card { border: 1px solid #eee; border-radius: 14px; padding: 14px; background: #fff; color:black}
+.row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.title { font-weight: 700; font-size: 16px; }
+.meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; color: #444; font-size: 13px; }
+.meta-item { white-space: nowrap; }
+.pill { padding: 2px 8px; border-radius: 999px; background: #f5f5f5; border: 1px solid #e7e7e7; font-size: 12px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.btn { padding: 8px 10px; border: 1px solid #ddd; border-radius: 10px; background: #fff; cursor: pointer; color:black;}
+.btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.btn.danger { border-color: #f2b4b4; }
+.body { margin-top: 10px; white-space: pre-wrap; }
+.images { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.images a { font-size: 13px; color: inherit; text-decoration: underline; }
+.meta2 { margin-top: 10px; display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }
+.muted { color: #666; }
+.toolbar { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+.rerun { margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee; }
+.rerun-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
 </style>
